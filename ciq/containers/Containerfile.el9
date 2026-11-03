@@ -1,0 +1,2 @@
+FROM docker.io/rockylinux/rockylinux:9
+RUN dnf -y install gcc make flex bison bc perl diffutils findutils elfutils-libelf-devel openssl-devel python3 kmod hostname && dnf clean all

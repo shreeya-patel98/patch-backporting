@@ -11,6 +11,15 @@ import yaml
 
 from agent.invoke_llm import do_backport, initial_agent
 from check.usage import get_usage
+from agent.claude_agent import ClaudeAgentExecutor
+
+def _usage(data):
+    if data.provider != "anthropic":
+        return get_usage(data.openai_key)
+    u = ClaudeAgentExecutor.usage
+    cost = ClaudeAgentExecutor.cost(data.anthropic_model)
+    return {"total_cost": cost,
+            "total_consume_tokens": u["input"] + u["output"] + u["cache_read"] + u["cache_write"]}
 from tools.logger import add_file_handler, logger
 from tools.project import Project
 
@@ -53,6 +62,14 @@ def load_yml(file_path: str):
     data.project_dir = config.get("project_dir")
     data.patch_dataset_dir = config.get("patch_dataset_dir")
     data.openai_key = config.get("openai_key")
+    # Claude configuration (provider: anthropic). Key comes from ANTHROPIC_API_KEY.
+    data.provider = config.get("provider", "openai")
+    data.anthropic_model = config.get("anthropic_model", "claude-opus-5-5")
+    data.effort = config.get("effort", "medium")
+    data.max_cost = config.get("max_cost", 3.0)
+    data.max_iter_hunk = config.get("max_iter_hunk", 15)
+    data.max_iter_patch = config.get("max_iter_patch", 10)
+    data.anthropic_fallback = config.get("anthropic_fallback", True)
     data.tag = config.get("tag")
 
     # Azure OpenAI configuration (optional)
@@ -150,13 +167,21 @@ def main():
     project = Project(data)
     project.repo.git.clean("-fdx")
     start_time = time.time()
-    before_usage = get_usage(data.openai_key)
+    before_usage = _usage(data)
     agent_executor, llm = initial_agent(project, data, debug_mode)
     try:
         do_backport(agent_executor, project, data, llm, logfile)
+        if project.poc_succeeded and project.succeeded_patches:
+            out = os.path.join(data.patch_dataset_dir, "backport.patch")
+            with open(out, "w") as f:
+                vd = getattr(project, "validated_diff", "")
+                f.write((vd + "\n") if vd else "\n".join(project.succeeded_patches))
+            logger.info(f"Backported patch written to {out}")
+            with open(os.path.join(data.patch_dataset_dir, "REVIEW_NOTES"), "w") as f:
+                f.write("\n".join(getattr(project, "anchor_notes", [])) + "\n")
         end_time = time.time()
         time.sleep(10)
-        after_usage = get_usage(data.openai_key)
+        after_usage = _usage(data)
         logger.debug(
             f"This patch total cost: ${(after_usage['total_cost'] - before_usage['total_cost']):.2f}"
         )
@@ -170,7 +195,7 @@ def main():
         logger.debug("Start to calculate cost!")
         end_time = time.time()
 
-        after_usage = get_usage(data.openai_key)
+        after_usage = _usage(data)
         logger.debug(
             f"This patch total cost: ${(after_usage['total_cost'] - before_usage['total_cost']):.2f}"
         )

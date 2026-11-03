@@ -10,6 +10,7 @@ from git import Repo
 from langchain_core.tools import tool
 
 import tools.utils as utils
+import tools.anchors as anchors
 from tools.logger import logger
 
 
@@ -26,6 +27,9 @@ class Project:
 
         self.new_patch_parent = data.new_patch_parent
         self.target_release = data.target_release
+        self.upstream_sha = data.new_patch
+        self.anchor_warned = set()  # misplacement errors already shown once
+        self.anchor_notes = []
         self.succeeded_patches = []
         self.context_mismatch_times = 0
         self.round_succeeded = False
@@ -534,12 +538,33 @@ class Project:
                 self.repo.git.reset("--hard")
                 return ret
 
+        # CIQ: wrong-function check (pure git) before spending build time.
+        try:
+            up = anchors.upstream_anchors(self.dir, self.upstream_sha)
+            errs, self.anchor_notes = anchors.misplacements(
+                self.dir, ref, up, anchors.worktree_anchors(self.dir))
+        except Exception as e:  # never let the checker itself block a backport
+            logger.warning(f"anchor check skipped: {e}")
+            errs = []
+        new = [e for e in errs if e not in self.anchor_warned]
+        if new:
+            self.anchor_warned.update(new)
+            logger.info("Function-anchor check                FAILED")
+            ret += ("The patch applies, but at least one change seems to land in the wrong "
+                    "function compared to upstream:\n" + "\n".join(new) + "\n"
+                    "Use `viewcode`/`locate_symbol` to find the function upstream changes and move "
+                    "the hunk there. If this tree genuinely has that code in a different function, "
+                    "resubmit the same patch and it will be accepted with a reviewer note.\n")
+            self.repo.git.reset("--hard")
+            return ret
+        self.anchor_notes += [f"ACCEPTED AFTER WARNING: {e}" for e in errs]
         # compile the patch
         logger.debug("Start compile the patched source code")
         if not os.path.exists(os.path.join(self.dir, "build.sh")):
             logger.debug("No build.sh file found.")
             ret += "The patched source code could be COMPILED successfully! I really thank you for your great efforts.\n"
             self.compile_succeeded = True
+            self.validated_diff = self.repo.git.diff()
             return ret
 
         # build_process = subprocess.Popen(
@@ -550,27 +575,19 @@ class Project:
         #     cwd=self.dir,
         #     text=True,
         # )
-        docker_command = [
-            "docker",
-            "run",
-            "-v",
-            f"{self.dir}:{self.dir}",
-            "--rm",
-            "build-kernel-ubuntu-16.04",
-            "/bin/bash",
-            "-c",
-            f"cd {self.dir}; bash build.sh",
-        ]
+        # CIQ: build.sh handles its own containerisation (Rocky image matched to
+        # the branch), so run it directly instead of the paper's ubuntu image.
+        docker_command = ["/bin/bash", "build.sh"]
         build_process = subprocess.Popen(
             docker_command,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             cwd=self.dir,
             text=True,
         )
         try:
-            _, compile_result = build_process.communicate(timeout=60 * 60)
+            compile_result, _ = build_process.communicate(timeout=60 * 60)
         except subprocess.TimeoutExpired:
             build_process.kill()
             ret += f"The compilation process of the patched source code is timeout. "
@@ -585,13 +602,9 @@ class Project:
 
         if build_process.returncode != 0:
             logger.info(f"Compilation                       FAILED")
-            error_lines = "\n".join(
-                [
-                    line
-                    for line in compile_result.splitlines()
-                    if "error:" in line.lower()
-                ]
-            )
+            # build.sh already trims output to errors with context; keep it all
+            # (capped) so the model also sees non-"error:" failures.
+            error_lines = compile_result.strip()[-6000:] or "(build failed with no output)"
             logger.debug(error_lines)
             ret += "The source code could not be COMPILED successfully after applying the patch. "
             ret += "Next I'll give you the error message during compiling, and you should modify the error patch. "
@@ -604,6 +617,9 @@ class Project:
             logger.info(f"Compilation                       PASS")
             ret += "The patched source code could be COMPILED successfully! I really thank you for your great efforts.\n"
             self.compile_succeeded = True
+            # CIQ: record exactly what is in the tree when the build passes
+            # (hunks are context-revised during apply, so joining them is not reliable).
+            self.validated_diff = self.repo.git.diff()
         # self.repo.git.reset("--hard")
         return ret
 

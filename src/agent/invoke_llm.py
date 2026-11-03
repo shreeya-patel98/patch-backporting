@@ -16,9 +16,21 @@ from agent.prompt import (
 from tools.logger import logger
 from tools.project import Project
 from tools.utils import split_patch
+from agent.claude_agent import ClaudeAgentExecutor
 
 
 def initial_agent(project: Project, data, debug_mode: bool):
+    if data.provider == "anthropic":
+        logger.info(f"Using Claude: {data.anthropic_model}")
+        viewcode, locate_symbol, validate, git_history, git_show = project.get_tools()
+        executor = ClaudeAgentExecutor(
+            SYSTEM_PROMPT, USER_PROMPT_HUNK,
+            [viewcode, locate_symbol, validate, git_history, git_show],
+            data, max_iterations=data.max_iter_hunk,
+            stop_when=lambda: project.round_succeeded,
+        )
+        return executor, None
+
     use_azure = data.use_azure
 
     if use_azure:
@@ -93,7 +105,7 @@ def do_backport(
                     "target_release": data.target_release,
                     "similar_block": similar_block,
                 },
-                {"callbacks": [log_handler]},
+                {"logfile": logfile} if data.provider == "anthropic" else {"callbacks": [log_handler]},
             )
             if not project.round_succeeded:
                 logger.debug(
@@ -131,10 +143,17 @@ def do_backport(
     # XXX maybe refactor initial_agent function to cover
     viewcode, locate_symbol, validate, _, _ = project.get_tools()
     tools = [viewcode, locate_symbol, validate]
-    agent = create_tool_calling_agent(llm, tools, prompt)
-    agent_executor = AgentExecutor(
-        agent=agent, tools=tools, verbose=True, max_iterations=20
-    )
+    if data.provider == "anthropic":
+        agent_executor = ClaudeAgentExecutor(
+            SYSTEM_PROMPT_PTACH, USER_PROMPT_PATCH, tools, data,
+            max_iterations=data.max_iter_patch, stop_when=lambda: project.poc_succeeded,
+        )
+        log_handler = None
+    else:
+        agent = create_tool_calling_agent(llm, tools, prompt)
+        agent_executor = AgentExecutor(
+            agent=agent, tools=tools, verbose=True, max_iterations=20
+        )
     agent_executor.invoke(
         {
             "project_url": data.project_url,
@@ -144,7 +163,7 @@ def do_backport(
             "complete_patch": complete_patch,
             "compile_ret": validate_ret,
         },
-        {"callbacks": [log_handler]},
+        {"logfile": logfile} if data.provider == "anthropic" else {"callbacks": [log_handler]},
     )
     if project.poc_succeeded:
         logger.info(

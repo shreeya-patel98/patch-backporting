@@ -147,3 +147,7 @@ venv
 dataset
 .env
 .vscode
+# CIQ: local secrets and run output
+.env.sh
+logs/
+ciq/containers/build.log
